@@ -1,64 +1,57 @@
-//    shellmemory.c
-
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "shellmemory.h"
 
-struct MEM{
+struct MEM {
     char *var;
     char *value;
 };
 
-struct MEM variables[MAX_VARS];
+static struct MEM variables[MAX_VARS];
 
-# pragma mark Shell Memory Initialization Tasks
-
-int initializeShellMemory(){
-    for (int i = 0; i < MAX_VARS; i++){
-        variables[i].var = malloc(sizeof(char*));
-        variables[i].value = malloc(sizeof(char*));
+int initializeShellMemory(void) {
+    for (int i = 0; i < MAX_VARS; i++) {
+        free(variables[i].var);
+        free(variables[i].value);
+        variables[i] = (struct MEM){0};
     }
-    
     return 0;
 }
 
-# pragma mark Shell Memory IO Operations
+static char *copyString(const char *value) {
+    size_t size = strlen(value) + 1;
+    char *copy = malloc(size);
+    if (copy) memcpy(copy, value, size);
+    return copy;
+}
 
-int setVariable(char var[], char value[]){
-    
-    // int setVariable(char var[], char value[]) returns:
-    // 0 if the variable was correctly assigned or overwritten
-    // 5 if there is no more space for variables
-    
-    int i = 0;
-    
-    while(*variables[i].var != (char)NULL && strcmp(variables[i].var, var) != 0){
-        if(i == MAX_VARS -1)
+int setVariable(char var[], char value[]) {
+    if (!var || !*var || !value) return 5;
+    int i;
+    for (i = 0; i < MAX_VARS; i++) {
+        if (!variables[i].var || strcmp(variables[i].var, var) == 0) break;
+    }
+    if (i == MAX_VARS) return 5;
+
+    char *copy = copyString(value);
+    if (!copy) return 5;
+    if (!variables[i].var) {
+        variables[i].var = copyString(var);
+        if (!variables[i].var) {
+            free(copy);
             return 5;
-        i++;
+        }
     }
-    
-    variables[i].var = strcpy(variables[i].var, var);
-    variables[i].value = strcpy(variables[i].value, value);
-
+    free(variables[i].value);
+    variables[i].value = copy;
     return 0;
 }
 
-char* readVariable(char var[]){
-    
-    // char* readVariable(char var[]) returns:
-    // char* to the string if the variable was found
-    // NULL pointer if the variable was not found
-    
-    int i = 0;
-    
-    while(strcmp(variables[i].var, var) != 0 && *variables[i].var != (char)NULL){
-        if(i == MAX_VARS -1)
-            return NULL;
-        i++;
+char *readVariable(char var[]) {
+    if (!var) return NULL;
+    for (int i = 0; i < MAX_VARS && variables[i].var; i++) {
+        if (strcmp(variables[i].var, var) == 0) return variables[i].value;
     }
-    
-    return variables[i].value;
+    return NULL;
 }

@@ -53,4 +53,18 @@ This session demonstrates:
 - seeking backward and reading the tail into another variable (`var`),
 - buffer ownership tied to the FD (variables hold copies and remain valid after `close`).
 
+## Tests and browser build
+
+Run the native driver regression suite and the shell walkthrough on Linux.
+
+```sh
+sh tests/run-native.sh
+SANITIZE=1 sh tests/run-native.sh
+```
+
+The [browser bridge](browser/README.md) compiles the same driver to WebAssembly and exposes its
+FAT, raw blocks, and open file cursor for Disk Lab. Newly written images use the `MFS1` header
+and store file lengths in bytes. Legacy images with ambiguous lengths are rejected to protect
+their contents.
+
 ---

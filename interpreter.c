@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 
 #include "shell.h"
 #include "shellmemory.h"
@@ -83,7 +85,8 @@ int interpreter(char *parsedCommand[]){
         return writeCommandEXAM(parsedCommand);
     
     else if(strcmp(&parsedCommand[0][0], "read_EXAM") == 0)
-        return readCommandEXAM(parsedCommand);
+        return parsedCommand[2] && strcmp(parsedCommand[2], "|") == 0
+            ? readpipeCommandEXAM(parsedCommand) : readCommandEXAM(parsedCommand);
 
     else if(strcmp(&parsedCommand[0][0], "open_EXAM") == 0)
         return openCommandEXAM(parsedCommand);
@@ -152,7 +155,7 @@ int printCommand(char *parsedCommand[]){
     
     char *value = readVariable(parsedCommand[1]);
 
-    if (isalnum(*value))
+    if (value)
         printf("%s\n",value);
     else
         printf("Variable does not exist\n");
@@ -167,6 +170,7 @@ int runCommand(char *parsedCommand[]){
     char *filename = parsedCommand[1];
     char *readable = "r";
     
+    if (!filename) return 1;
     // Opening the file
     file = fopen(filename, readable);
     
@@ -180,9 +184,10 @@ int runCommand(char *parsedCommand[]){
     char command[MAX_BUFFER];
     while(fgets(command,MAX_BUFFER,file) != NULL){
         
-        char *parsedCommand[5];
-        parser(command, parsedCommand);
-        int returnCode = interpreter(parsedCommand);
+        char *tokens[MAX_TOKENS];
+        parser(command, tokens);
+        int returnCode = interpreter(tokens);
+        freeParsedCommand(tokens);
         
         if(returnCode == 1)
             printf("Unknown command: Type \"help\" to find a list of valid commands with their syntax.\n");
@@ -235,274 +240,171 @@ int execCommand(char *parsedCommand[]){
 }
 
 
-int mountCommand(char *parsedCommand[]){
-    
-    // Argument Count ERROR handeling
-    if (parsedCommand[1] == NULL && parsedCommand[2] == NULL && parsedCommand[3] == NULL ){
-        printf("Wrong syntax. The mount command requires a partion name, a number of blocks, and block size as arguments.\n");
-        return 1;
-    }
-    
-    // Check if partition exists
-    char filename[70];
-    snprintf(filename, sizeof(filename), "PARTITION/%s.txt", parsedCommand[1]);
-    int blockSize = atoi(parsedCommand[3]);
-    int totalBlocks = atoi(parsedCommand[2]);
-    
-    FILE *file = fopen(filename, "r");
-    int status;
-
-    // If file does not exists
-    if (file == NULL){
-        // Create it with partition()
-        //fclose(file);
-        status = partition(parsedCommand[1], blockSize, totalBlocks);
-    }
-    else{
-        // Else, call mountFS();
-        fclose(file);
-        status = mountFS(parsedCommand[1]);
-    }
-    
-    if(status == 0)
-        printf("Could not mount volume with name %s.\n" , parsedCommand[1]);
-    
-    return 0;
+static int parseInteger(const char *value, int *result) {
+    if (!value || !*value) return 0;
+    char *end;
+    errno = 0;
+    long number = strtol(value, &end, 10);
+    if (errno || end == value || *end || number < INT_MIN || number > INT_MAX) return 0;
+    *result = (int)number;
+    return 1;
 }
 
-int writeCommand(char *parsedCommand[]){
-    
-    // Argument Count ERROR handeling
-    if (parsedCommand[1] == NULL && parsedCommand[2] == NULL){
-        printf("Wrong syntax. The write command requires a filename and a string enclosed by \"[]\" as arguments.\n");
+int mountCommand(char *parsedCommand[]) {
+    int totalBlocks, blockSize;
+    if (!parsedCommand[1] || !parseInteger(parsedCommand[2], &totalBlocks) ||
+        !parseInteger(parsedCommand[3], &blockSize) || totalBlocks <= 0 || blockSize <= 0) {
+        puts("Usage: mount PARTITION TOTAL_BLOCKS BLOCK_SIZE");
         return 1;
     }
-    
-    // Open file only opens files once, so there is no need to check if it is open already
-    int fileID = openFile(parsedCommand[1]);
-    
-    // Write the string to the file
-    float strLenght = strlen(parsedCommand[2]);
-    float blockSize = getBlockSize();
-    int blocksToWrite = (strLenght / blockSize) + 1;
-    
-    for (int i = 0; i < blocksToWrite; i++) {
-        int ptrMovement = i * getBlockSize();
-        char *ptr = (parsedCommand[2] + ptrMovement);
-        writeBlock(fileID, ptr);
-    }
-    
-    closeFile(fileID);
-    return 0;
-}
-
-int readCommand(char *parsedCommand[]){
-    
-    // Argument Count ERROR handeling
-    if (parsedCommand[1] == NULL && parsedCommand[2] == NULL ){
-        printf("Wrong syntax. The read command requires a filename and a shell variable name as arguments.\n");
-        return 1;
-    }
-    
-    // Open file only opens files once, so there is no need to check if it is open already
-    int fileID = openFile(parsedCommand[1]);
-    if(fileID == -1){
-        printf("Failed to open file.\n");
+    if (!mountOrCreateFS(parsedCommand[1], blockSize, totalBlocks)) {
+        printf("Could not mount volume with name %s.\n", parsedCommand[1]);
         return 2;
     }
-    
-    // Read the string from the file
-    char *ptr = readBlock(fileID);
-    if(ptr ==  NULL){
-        printf("Read command failed.\n");
-        return 2; // Read block failed
-    }
-    
-    char *finalStr = malloc(MAX_BUFFER);
-    strcpy(finalStr, ptr);
-    
-    while(ptr != NULL){
-        ptr = readBlock(fileID);
-        if (ptr == NULL)
-            break;
-        strcat(finalStr, ptr);
-    }
-    
-    
-    // Write the string to the shell variable
-    setVariable(parsedCommand[2], finalStr);
-    closeFile(fileID);
-    
     return 0;
 }
 
-
-
-
-int readCommandEXAM(char *parsedCommand[]){
-    // Implement the functionality in the files
-    // DISK_driver_problem1.c [.h] that were provided to you
-
-    // You can make visible any data structures that you 
-    // might need, by importing the appropriate headers
-    // and making needed data structures visible.
-    // Argument Count ERROR handeling
-    int err, fd;
-    char* var_name, *finalStr;
-    if (parsedCommand[1] == NULL && parsedCommand[2] == NULL ){
-        printf("Wrong syntax. The read_EXAM command requires a active file id and a shell variable name as arguments.\n");
+int writeCommand(char *parsedCommand[]) {
+    if (!parsedCommand[1] || !parsedCommand[2]) {
+        puts("Usage: write FILE [TEXT]");
         return 1;
     }
-
-    finalStr = NULL;
-    fd = atoi(parsedCommand[1]);
-    var_name = parsedCommand[2];
-
-    err = readExamImpl(fd, &finalStr);
-
-    if (err == -3) {
-        printf("ERROR: Open the file first.\n");
-        return -1;
-    } else if (err < 0) {
-        printf("Failed to read file.\n");
-        free(finalStr);
-        return -1;
+    int file = openFile(parsedCommand[1]);
+    if (file < 0) {
+        puts("Failed to open file.");
+        return 2;
     }
-
-    // Write the string to the shell variable
-    setVariable(var_name, finalStr);
-    return 0;
-}
-
-
-int writeCommandEXAM(char *parsedCommand[]){
-    // Argument Count ERROR handeling
-    int err, fd;
-    char *finalStr;
-    if (parsedCommand[1] == NULL && parsedCommand[2] == NULL ){
-        printf("Wrong syntax. The write_EXAM command requires a active file id and and a string enclosed by \"[]\" as arguments.\n");
-        return 1;
-    }
-
-    finalStr = parsedCommand[2];
-    fd = atoi(parsedCommand[1]);
-
-    err = writeExamImpl(fd, finalStr);
-
-    if (err == ERR_FD_NOT_OPEN) {
-        printf("ERROR: Open the file first.\n");
-        return -1;
-    } else if (err < 0) {
-        printf("Failed to write file.\n");
-        free(finalStr);
-        return -1;
+    int status = diskWriteBytes(file, fat[file].file_length, parsedCommand[2], strlen(parsedCommand[2]));
+    closeFile(file);
+    if (status < 0) {
+        puts("Failed to write file.");
+        return 2;
     }
     return 0;
 }
 
-
-int openCommandEXAM(char *parsedCommand[]){
-    int err, active_file_id;
-    char* filename;
-
-    /* check arguments*/
-    if (parsedCommand[1] == NULL && parsedCommand[2] == NULL){
-        printf("Wrong syntax. The open_EXAM command requires a active file id and a filename as arguments.\n");
+int readCommand(char *parsedCommand[]) {
+    if (!parsedCommand[1] || !parsedCommand[2]) {
+        puts("Usage: read FILE VARIABLE");
         return 1;
     }
+    int file = openFile(parsedCommand[1]);
+    if (file < 0) {
+        puts("Failed to open file.");
+        return 2;
+    }
+    size_t length = (size_t)fat[file].file_length;
+    char *value = malloc(length + 1);
+    int read = value ? diskReadBytes(file, 0, value, length) : -1;
+    closeFile(file);
+    if (read <= 0) {
+        free(value);
+        puts("Read command failed.");
+        return 2;
+    }
+    value[read] = '\0';
+    int status = setVariable(parsedCommand[2], value);
+    free(value);
+    return status;
+}
 
-    /* parse active file id*/
-    active_file_id = atoi(parsedCommand[1]);
-    filename = parsedCommand[2];
-    /* call the implementation function*/
-    err = openExamImpl(active_file_id, filename);
-    /* check error code*/
-    if (err == ERR_FD_OPEN) {
-        printf("ERROR: Index number in use.\n");
-        return -1;
-    } else if (err < 0) {
-        printf("Failed to read file.\n");
-        return -1;
+int readCommandEXAM(char *parsedCommand[]) {
+    int fd;
+    if (!parseInteger(parsedCommand[1], &fd) || !parsedCommand[2]) {
+        puts("Usage: read_EXAM FD VARIABLE");
+        return 1;
+    }
+    char *value;
+    int read = readExamImpl(fd, &value);
+    if (read < 0) {
+        puts(read == ERR_FD_NOT_OPEN ? "ERROR: Open the file first." : "Failed to read file.");
+        return 2;
+    }
+    int status = setVariable(parsedCommand[2], value);
+    free(value);
+    return status;
+}
+
+int writeCommandEXAM(char *parsedCommand[]) {
+    int fd;
+    if (!parseInteger(parsedCommand[1], &fd) || !parsedCommand[2]) {
+        puts("Usage: write_EXAM FD [TEXT]");
+        return 1;
+    }
+    int status = writeExamImpl(fd, parsedCommand[2]);
+    if (status < 0) {
+        puts(status == ERR_FD_NOT_OPEN ? "ERROR: Open the file first." : "Failed to write file.");
+        return 2;
     }
     return 0;
 }
 
-int closeCommandEXAM(char *parsedCommand[]){
-    int err, fd;
-    if (parsedCommand[1] == NULL){
-        printf("Wrong syntax. The close_EXAM command requires a active file id as arguments.\n");
+int openCommandEXAM(char *parsedCommand[]) {
+    int fd;
+    if (!parseInteger(parsedCommand[1], &fd) || !parsedCommand[2]) {
+        puts("Usage: open_EXAM FD FILE");
         return 1;
     }
-    fd = atoi(parsedCommand[1]);
-    err = closeExamImpl(fd);
-    if (err == ERR_FD_NOT_OPEN) {
-        printf("ERROR: Index number not in use.\n");
-        return -1;
-    } else if (err < 0) {
-        printf("Failed to close file.\n");
-        return -1;
+    int status = openExamImpl(fd, parsedCommand[2]);
+    if (status < 0) {
+        puts(status == ERR_FD_OPEN ? "ERROR: Index number in use." : "Failed to open file.");
+        return 2;
     }
     return 0;
 }
 
-int seekCommandEXAM(char *parsedCommand[]){
-    int err, fd, offset;
-    if (parsedCommand[1] == NULL || parsedCommand[2] == NULL){
-        printf("Wrong syntax. The seek_EXAM command requires a active file id and offset as arguments.\n");
+int closeCommandEXAM(char *parsedCommand[]) {
+    int fd;
+    if (!parseInteger(parsedCommand[1], &fd)) {
+        puts("Usage: close_EXAM FD");
         return 1;
     }
-    fd = atoi(parsedCommand[1]);
-    offset = atoi(parsedCommand[2]);
-    err = seekExamImpl(fd, offset);
-    if (err == ERR_FD_NOT_OPEN) {
-        printf("ERROR: Index number not in use.\n");
-        return -1;
-    } else if (err == ERR_OUT_OF_UPPER_BOUNDS) {
-        printf("ERROR: Out of bounds. Stopped at end of file.\n");
-        return -1;
-    } else if (err == ERR_OUT_OF_LOWER_BOUNDS) {
-        printf("ERROR: Out of bounds. Stopped at start of file.\n");
-        return -1;
+    if (closeExamImpl(fd) < 0) {
+        puts("ERROR: Index number not in use.");
+        return 2;
     }
     return 0;
+}
+
+int seekCommandEXAM(char *parsedCommand[]) {
+    int fd, offset;
+    if (!parseInteger(parsedCommand[1], &fd) || !parseInteger(parsedCommand[2], &offset)) {
+        puts("Usage: seek_EXAM FD OFFSET");
+        return 1;
+    }
+    int status = seekExamImpl(fd, offset);
+    if (status == ERR_FD_NOT_OPEN) {
+        puts("ERROR: Index number not in use.");
+    } else if (status == ERR_OUT_OF_UPPER_BOUNDS) {
+        puts("ERROR: Out of bounds. Stopped at end of file.");
+    } else if (status == ERR_OUT_OF_LOWER_BOUNDS) {
+        puts("ERROR: Out of bounds. Stopped at start of file.");
+    }
+    return status < 0 ? 2 : 0;
 }
 
 int readpipeCommandEXAM(char *parsedCommand[]) {
-    int err, fd;
-    char* content, *var_name;
-    if (parsedCommand[1] == NULL || parsedCommand[2] == NULL){
-        printf("Wrong syntax. The readpipe_EXAM command requires a active file id and var as arguments.\n");
+    int fd;
+    if (!parseInteger(parsedCommand[1], &fd) || !parsedCommand[2]) {
+        puts("Usage: read_EXAM FD | set VARIABLE");
         return 1;
     }
-    if (strcmp(parsedCommand[2], "|") != 0) {
-        return readCommandEXAM(parsedCommand);
-    }
-
-    if (strcmp(parsedCommand[3], "set") != 0) {
-        printf("Currently only set command is supported.\n");
+    if (strcmp(parsedCommand[2], "|") != 0) return readCommandEXAM(parsedCommand);
+    if (!parsedCommand[3] || strcmp(parsedCommand[3], "set") != 0 || !parsedCommand[4]) {
+        puts("Usage: read_EXAM FD | set VARIABLE");
         return 1;
     }
-    var_name = parsedCommand[4];
-    if (!var_name) {
-        printf("Missing variable name.\n");
-        return 1;
+    int status = readpipeExamImpl(fd);
+    if (status < 0) {
+        puts(status == ERR_FD_NOT_OPEN ? "ERROR: Index number not in use." : "Failed to read pipe.");
+        return 2;
     }
-    fd = atoi(parsedCommand[1]);
-    err = readpipeExamImpl(fd);
-    if (err == ERR_FD_NOT_OPEN) {
-        printf("ERROR: Index number not in use.\n");
-        return -1;
+    char *value = acceptPipeInput(fd);
+    if (!value) {
+        puts("Failed to copy pipe buffer.");
+        return 2;
     }
-    content = acceptPipeInput(fd);
-    if (content == NULL) {
-        printf("Failed to copy pipe buffer");
-        return 1;
-    }
-    setVariable(var_name, content);
-    return 0;
+    status = setVariable(parsedCommand[4], value);
+    free(value);
+    return status;
 }
-
-
-
-
-

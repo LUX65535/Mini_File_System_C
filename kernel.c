@@ -11,6 +11,7 @@
 #include "cpu.h"
 #include "pcb.h"
 #include "memorymanager.h"
+#include "DISK_driver.h"
 
 #define DEFAULT_QUANTA 2
 
@@ -33,11 +34,17 @@ void handlePageFault(struct PCB *pcb);
 
 #pragma mark General Entry Point
 
+static void closeKernelFiles(void) {
+    initIO();
+    initializeShellMemory();
+}
+
 int main(int argc, const char * argv[]) {
-    int error = 0;
+    (void)argc;
+    (void)argv;
+    atexit(closeKernelFiles);
     boot();
-    error = kernel();
-    return error;
+    return kernel();
 }
 
 #pragma mark Kernel Initialization Tasks
@@ -53,8 +60,6 @@ void boot(){
     
     printf("System kernel loaded!\n");
     
-    // Launch Shell
-    shellUI();
 }
 
 int kernel(){

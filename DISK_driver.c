@@ -1,388 +1,402 @@
-//    DISK_driver.c
+#define _POSIX_C_SOURCE 200809L
 
 #include "DISK_driver.h"
+#include "DISK_driver_problem1.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
+#define MAX_NAME 127
+#define MAX_PARTITION_BYTES (16u * 1024 * 1024)
 
-// Helpers
-FILE *partitionFile;
-char filename[150];
-char writebuffer[50000];
-char writebuffer2[50000];
+struct PARTITION currentPartition = { -1, -1, -1 };
+struct FAT fat[MAX_FILES];
+char *blockBuffer;
+FILE *active_file_table[MAX_OPENFILES];
+int active_file_table_owners[MAX_OPENFILES];
 
-int partitionFolderExists(void);
-void updateFATOnDisk(void);
-void fseekToDataSection(FILE *file);
-void fseekToBlock(FILE *file, int blockID);
-void fseekToNextFreeBlock(FILE *file);
+static char partitionPath[MAX_NAME + 16];
+static unsigned char *partitionData;
 
-void initIO(){
-    
+static struct FAT emptyEntry(void) {
+    struct FAT entry = { .file_length = -1, .current_location = -1 };
+    for (int i = 0; i < MAX_BLOCKS; i++) entry.blockPtrs[i] = -1;
+    return entry;
+}
+
+void initIO(void) {
     for (int i = 0; i < MAX_FILES; i++) {
-        struct FAT* blankFile = &fat[i];
-        blankFile->filename = NULL;
-        blankFile->file_length = -1;
-        for (int j = 0; j < MAX_BLOCKS; j++)
-            blankFile->blockPtrs[j] = -1;
-        blankFile->current_location = -1;
+        free(fat[i].filename);
+        fat[i] = emptyEntry();
     }
-    
     for (int i = 0; i < MAX_OPENFILES; i++) {
-        active_file_table[i]  = NULL;
+        if (active_file_table[i]) fclose(active_file_table[i]);
+        active_file_table[i] = NULL;
         active_file_table_owners[i] = -1;
     }
-    
-    currentPartition.block_size = -1;
-    currentPartition.total_blocks = -1;
-    currentPartition.last_free_block = -1;
+    resetExamFiles();
+    free(blockBuffer);
+    free(partitionData);
+    blockBuffer = NULL;
+    partitionData = NULL;
+    currentPartition = (struct PARTITION){ -1, -1, -1 };
+    partitionPath[0] = '\0';
 }
 
-float getBlockSize(){
-    return 1.0f*currentPartition.block_size;
+float getBlockSize(void) {
+    return (float)currentPartition.block_size;
 }
 
-#pragma mark Mounting Functions
-int partition(char *name, int blocksize, int totalblocks){
-    
-    // Starting fresh
-    initIO();
-    currentPartition.block_size = blocksize;
-    currentPartition.total_blocks = totalblocks;
-    currentPartition.last_free_block = 0;
-    
-    // Checking if "PARTITION folder exists, creating it if not"
-    if(! partitionFolderExists())
-        system("mkdir ./PARTITION");
-    
-    // Creating the file and writing the FAT to the disk
-    snprintf(filename, sizeof(filename), "PARTITION/%s.txt", name);
-    partitionFile = fopen(filename, "w");
-    if(partitionFile == NULL)
-        return 0;
-    updateFATOnDisk();
-    
-    // Appending blocksize * totalblocks number of '0's
-    for (int zeroes = totalblocks*blocksize; zeroes > 0; zeroes--)
-        fputc('0', partitionFile);
-    
-    fclose(partitionFile);
-    
-    // malloc() block_buffer
-    blockBuffer = malloc(currentPartition.block_size);
-    
+static int validName(const char *name) {
+    if (!name || !*name || strnlen(name, MAX_NAME + 1) > MAX_NAME ||
+        strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || strcmp(name, "(null)") == 0) return 0;
+    for (const unsigned char *c = (const unsigned char *)name; *c; c++) {
+        if (*c < 32 || *c == 127 || *c == ',' || *c == '/' || *c == '\\') return 0;
+    }
     return 1;
 }
-int mountFS(char *name){
-    
-    initIO();
-    
-    // Opening the file
-    snprintf(filename, sizeof(filename), "PARTITION/%s.txt", name);
-    partitionFile = fopen(filename, "r");
-    if(partitionFile == NULL)
+
+static int makePath(char path[sizeof(partitionPath)], const char *name) {
+    if (!validName(name)) return 0;
+    snprintf(path, sizeof(partitionPath), "PARTITION/%s.txt", name);
+    return 1;
+}
+
+static size_t diskSize(struct PARTITION disk) {
+    if (disk.block_size <= 0 || disk.total_blocks <= 0 ||
+        (size_t)disk.block_size > MAX_PARTITION_BYTES / (size_t)disk.total_blocks) return 0;
+    return (size_t)disk.block_size * (size_t)disk.total_blocks;
+}
+
+static int blocksForLength(int length, int blocksize) {
+    return length ? (length - 1) / blocksize + 1 : 0;
+}
+
+static int saveDisk(const char *path, struct PARTITION disk, const struct FAT entries[MAX_FILES],
+                    const unsigned char *data) {
+    char temporary[sizeof(partitionPath) + sizeof(".tmp.XXXXXX")];
+    snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", path);
+    int fd = mkstemp(temporary);
+    if (fd < 0) return 0;
+    FILE *file = fdopen(fd, "wb");
+    if (!file) {
+        close(fd);
+        remove(temporary);
         return 0;
-    
-    // Reading the contents of currentPartition onto the file by getting the first line into write buffer
-    fgets(writebuffer, 50000, partitionFile);
-    sscanf(writebuffer, "%i, %i, %i\n", &currentPartition.block_size, &currentPartition.total_blocks, &currentPartition.last_free_block);
-    
-    // malloc() block_buffer
-    blockBuffer = malloc(currentPartition.block_size);
-    
-    // Writting the contents of fat[MAX_FILES] to the file
+    }
+
+    /* The table changes size as names and block IDs grow. Replace the full image. */
+    int ok = fprintf(file, "MFS1 %d, %d, %d\n", disk.block_size, disk.total_blocks, disk.last_free_block) >= 0;
+    for (int i = 0; i < MAX_FILES && ok; i++) {
+        const struct FAT *entry = &entries[i];
+        ok = fprintf(file, "%s, %d\n", entry->filename ? entry->filename : "(null)", entry->file_length) >= 0;
+        for (int j = 0; j < MAX_BLOCKS && ok; j++) {
+            ok = fprintf(file, j ? "; %d" : " %d", entry->blockPtrs[j]) >= 0;
+        }
+        if (ok) ok = fputc('\n', file) != EOF;
+    }
+    size_t size = diskSize(disk);
+    if (ok) ok = fwrite(data, 1, size, file) == size;
+    if (fclose(file) != 0) ok = 0;
+    if (ok && rename(temporary, path) == 0) return 1;
+    remove(temporary);
+    return 0;
+}
+
+static void installDisk(const char *path, struct PARTITION disk, const struct FAT entries[MAX_FILES],
+                        unsigned char *data, char *buffer) {
+    initIO();
+    strcpy(partitionPath, path);
+    currentPartition = disk;
+    memcpy(fat, entries, sizeof(fat));
+    partitionData = data;
+    blockBuffer = buffer;
+}
+
+int partition(char *name, int blocksize, int totalblocks) {
+    char path[sizeof(partitionPath)];
+    struct PARTITION disk = { blocksize, totalblocks, 0 };
+    size_t size = diskSize(disk);
+    if (!size || !makePath(path, name)) return 0;
+    if (mkdir("PARTITION", 0777) != 0 && errno != EEXIST) return 0;
+    unsigned char *data = calloc(size, 1);
+    char *buffer = malloc((size_t)blocksize + 1);
+    struct FAT entries[MAX_FILES];
+    for (int i = 0; i < MAX_FILES; i++) entries[i] = emptyEntry();
+    if (!data || !buffer || !saveDisk(path, disk, entries, data)) {
+        free(data);
+        free(buffer);
+        return 0;
+    }
+    installDisk(path, disk, entries, data, buffer);
+    return 1;
+}
+
+static int readLine(FILE *file, char *line, size_t capacity) {
+    if (!fgets(line, (int)capacity, file)) return 0;
+    size_t length = strlen(line);
+    if (!length || line[length - 1] != '\n') return 0;
+    line[length - 1] = '\0';
+    return 1;
+}
+
+static int readNumber(char **cursor, int lower, int upper, int *value) {
+    char *end;
+    errno = 0;
+    long number = strtol(*cursor, &end, 10);
+    if (errno || end == *cursor || number < lower || number > upper) return 0;
+    *cursor = end;
+    *value = (int)number;
+    return 1;
+}
+
+static int readSeparator(char **cursor, char separator) {
+    while (isspace((unsigned char)**cursor)) (*cursor)++;
+    if (**cursor != separator) return 0;
+    if (separator) (*cursor)++;
+    return 1;
+}
+
+int mountFS(char *name) {
+    char path[sizeof(partitionPath)];
+    if (!makePath(path, name)) return 0;
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+
+    struct PARTITION disk;
+    struct FAT entries[MAX_FILES];
+    for (int i = 0; i < MAX_FILES; i++) entries[i] = emptyEntry();
+    unsigned char *data = NULL;
+    char *buffer = NULL;
+    char line[MAX_NAME + 64];
+    char *cursor = line;
+    int ok = 0;
+    int usedBlocks[MAX_FILES * MAX_BLOCKS];
+    int usedCount = 0;
+
+    if (!readLine(file, line, sizeof(line))) goto done;
+    int versioned = strncmp(line, "MFS1 ", 5) == 0;
+    if (versioned) cursor += 5;
+    if (!readNumber(&cursor, 1, MAX_PARTITION_BYTES, &disk.block_size) ||
+        !readSeparator(&cursor, ',') ||
+        !readNumber(&cursor, 1, MAX_PARTITION_BYTES, &disk.total_blocks) ||
+        !readSeparator(&cursor, ',') ||
+        !readNumber(&cursor, 0, disk.total_blocks, &disk.last_free_block) ||
+        !readSeparator(&cursor, '\0')) goto done;
+    size_t size = diskSize(disk);
+    if (!size) goto done;
+    int maxFileLength = disk.block_size * MAX_BLOCKS;
     for (int i = 0; i < MAX_FILES; i++) {
-        struct FAT currentFile;
-
-        fgets(writebuffer, 50000, partitionFile);
-        char *token;
-        char const *nullFilename = "(null)";
-        char const comma = ',';
-        char const semicolon = ';';
-        
-        // Getting the filenames
-        token = strtok(writebuffer, &comma);
-        if(token == NULL)
-            return 0;
-        currentFile.filename = malloc(sizeof(&token));
-        strcpy(currentFile.filename, token);
-        if(!strcmp(currentFile.filename, nullFilename))
-            currentFile.filename = NULL;
-        
-        // Getting the file sizes
-        token = strtok(NULL, &comma);
-        currentFile.file_length = atoi(token);
-        
-        // Getting the file pointers
-        fgets(writebuffer, 50000, partitionFile);
-        token = strtok(writebuffer, &semicolon);
-        currentFile.blockPtrs[0] = atoi(token);
-        int j = 1;
-        for (; j < MAX_BLOCKS; j++){
-            token = strtok(NULL, &semicolon);
-            currentFile.blockPtrs[j] = atoi(token);
+        struct FAT *entry = &entries[i];
+        if (!readLine(file, line, sizeof(line))) goto done;
+        cursor = strchr(line, ',');
+        if (!cursor) goto done;
+        *cursor++ = '\0';
+        if (!readNumber(&cursor, -1, maxFileLength, &entry->file_length) ||
+            !readSeparator(&cursor, '\0')) goto done;
+        if (strcmp(line, "(null)") == 0) {
+            if (entry->file_length != -1) goto done;
+        } else {
+            if (!validName(line) || entry->file_length < 0) goto done;
+            for (int j = 0; j < i; j++) {
+                if (entries[j].filename && strcmp(entries[j].filename, line) == 0) goto done;
+            }
+            entry->filename = strdup(line);
+            if (!entry->filename) goto done;
+            entry->current_location = 0;
         }
-
-        // Finishing off
-        currentFile.current_location = 0;
-        fat[i] = currentFile;
+        int needed = entry->file_length > 0 ? blocksForLength(entry->file_length, disk.block_size) : 0;
+        /* The original block API stored a block count in this same field. */
+        if (!versioned && disk.block_size > 1 && needed > 0 && entry->file_length == needed) goto done;
+        if (!readLine(file, line, sizeof(line))) goto done;
+        cursor = line;
+        for (int j = 0; j < MAX_BLOCKS; j++) {
+            if (j && !readSeparator(&cursor, ';')) goto done;
+            if (!readNumber(&cursor, -1, disk.last_free_block - 1, &entry->blockPtrs[j])) goto done;
+            int block = entry->blockPtrs[j];
+            if ((j < needed) != (block >= 0)) goto done;
+            if (block >= 0) {
+                for (int k = 0; k < usedCount; k++) {
+                    if (usedBlocks[k] == block) goto done;
+                }
+                usedBlocks[usedCount++] = block;
+            }
+        }
+        if (!readSeparator(&cursor, '\0')) goto done;
     }
-    
-    fclose(partitionFile);
-    return 1;
+    if (usedCount != disk.last_free_block) goto done;
+    data = malloc(size);
+    buffer = malloc((size_t)disk.block_size + 1);
+    if (!data || !buffer || fread(data, 1, size, file) != size ||
+        fgetc(file) != EOF || ferror(file)) goto done;
+    ok = 1;
+
+done:
+    if (fclose(file) != 0) ok = 0;
+    if (ok) {
+        installDisk(path, disk, entries, data, buffer);
+        return 1;
+    }
+    for (int i = 0; i < MAX_FILES; i++) free(entries[i].filename);
+    free(data);
+    free(buffer);
+    return 0;
 }
 
-#pragma mark General IO Functions
-int openFile(char *name){
-    
-    // Checking if there is a free block in the data section to create a new file
-    if(currentPartition.last_free_block > currentPartition.total_blocks)
+int mountOrCreateFS(char *name, int blocksize, int totalblocks) {
+    char path[sizeof(partitionPath)];
+    if (!makePath(path, name)) return 0;
+    struct stat info;
+    if (stat(path, &info) == 0) return S_ISREG(info.st_mode) && mountFS(name);
+    if (errno != ENOENT) return 0;
+    return partition(name, blocksize, totalblocks);
+}
+
+int diskOpenEntry(const char *name) {
+    if (!partitionData || !validName(name)) return -1;
+    int freeEntry = -1;
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (fat[i].filename) {
+            if (strcmp(fat[i].filename, name) == 0) return i;
+        } else if (freeEntry < 0) {
+            freeEntry = i;
+        }
+    }
+    if (freeEntry < 0) return -1;
+    char *copy = strdup(name);
+    if (!copy) return -1;
+    struct FAT entries[MAX_FILES];
+    memcpy(entries, fat, sizeof(entries));
+    entries[freeEntry].filename = copy;
+    entries[freeEntry].file_length = 0;
+    entries[freeEntry].current_location = 0;
+    if (!saveDisk(partitionPath, currentPartition, entries, partitionData)) {
+        free(copy);
         return -1;
-    
-    // Lookup on the FAT
-    int FATindex = 0;
-    for (; FATindex < MAX_FILES; FATindex++)
-        if (fat[FATindex].filename == NULL || strcmp(fat[FATindex].filename, name) == 0)
-            break;
-    
-    // Checking if the file is not already open
-    int i = 0;
-    for (; i < MAX_OPENFILES; i++)
-        if(active_file_table_owners[i] == FATindex)
-            return FATindex;
-    
-    // Opening the partition file
-    int activeFileIndex = 0;
-    for(; activeFileIndex < MAX_OPENFILES; activeFileIndex++)
-        if(active_file_table[activeFileIndex] == NULL)
-            break;
-    if(activeFileIndex == MAX_OPENFILES)
-        return -1; // Too many files open at the same time
+    }
+    fat[freeEntry] = entries[freeEntry];
+    return freeEntry;
+}
 
-    active_file_table[activeFileIndex]  = fopen(filename, "r+");
-    active_file_table_owners[activeFileIndex] = FATindex;
-    
-    if(FATindex == MAX_FILES && fat[MAX_FILES -1].filename != NULL){
-        // File DNE on the FAT and FAT is full
-        fclose(active_file_table[activeFileIndex]);
-        active_file_table[activeFileIndex] = NULL;
-        active_file_table_owners[activeFileIndex] = -1;
-        
+static int validEntry(int file, int offset) {
+    return partitionData && file >= 0 && file < MAX_FILES && fat[file].filename &&
+        offset >= 0 && offset <= fat[file].file_length;
+}
+
+static size_t copyBytes(unsigned char *data, const struct FAT *entry, size_t offset, void *buffer,
+                        size_t count, int writing) {
+    size_t blocksize = (size_t)currentPartition.block_size;
+    size_t copied = 0;
+    while (copied < count) {
+        size_t logical = offset / blocksize;
+        size_t within = offset % blocksize;
+        size_t chunk = blocksize - within;
+        if (chunk > count - copied) chunk = count - copied;
+        unsigned char *disk = data + (size_t)entry->blockPtrs[logical] * blocksize + within;
+        unsigned char *bytes = (unsigned char *)buffer + copied;
+        if (writing) memcpy(disk, bytes, chunk);
+        else memcpy(bytes, disk, chunk);
+        offset += chunk;
+        copied += chunk;
+    }
+    return copied;
+}
+
+int diskReadBytes(int file, int offset, void *output, size_t count) {
+    if (!validEntry(file, offset) || (!output && count)) return -1;
+    size_t available = (size_t)(fat[file].file_length - offset);
+    if (count > available) count = available;
+    return (int)copyBytes(partitionData, &fat[file], (size_t)offset, output, count, 0);
+}
+
+int diskWriteBytes(int file, int offset, const void *data, size_t count) {
+    if (!validEntry(file, offset) || (!data && count)) return -1;
+    if (!count) return 0;
+    struct PARTITION disk = currentPartition;
+    int maxFileLength = disk.block_size * MAX_BLOCKS;
+    if (count > (size_t)(maxFileLength - offset)) return -1;
+    int end = offset + (int)count;
+    int length = end > fat[file].file_length ? end : fat[file].file_length;
+    int oldBlocks = blocksForLength(fat[file].file_length, disk.block_size);
+    int requiredBlocks = blocksForLength(length, disk.block_size);
+    if (requiredBlocks - oldBlocks > disk.total_blocks - disk.last_free_block) return -1;
+
+    size_t size = diskSize(disk);
+    unsigned char *nextData = malloc(size);
+    if (!nextData) return -1;
+    memcpy(nextData, partitionData, size);
+    struct FAT entries[MAX_FILES];
+    memcpy(entries, fat, sizeof(entries));
+    for (int i = oldBlocks; i < requiredBlocks; i++) {
+        entries[file].blockPtrs[i] = disk.last_free_block++;
+    }
+    entries[file].file_length = length;
+    copyBytes(nextData, &entries[file], (size_t)offset, (void *)data, count, 1);
+    if (!saveDisk(partitionPath, disk, entries, nextData)) {
+        free(nextData);
         return -1;
     }
-    else if(fat[FATindex].filename == NULL){
-        // Make a new file
-        fat[FATindex].filename = malloc(500);
-        strcpy(fat[FATindex].filename, name);
-        fat[FATindex].current_location = 0;
-        fat[FATindex].file_length = 0;
-        
-        // READ:
-        // ALL Seeking is done when doing IO, since the file system is NOT contigous and files do not have a pre-allocated size.
-        // Space in the data section will be allocated ON WRITE, so we are done here
-        
-        // Seeking to the data section
-        //fseekToDataSection(active_file_table[activeFileIndex]);
-        // Seeking to first block
-    }
-    else{
-        // Open a current file
-        // Data structures already initialized
-        fat[FATindex].current_location = 0;
-        
-        // READ:
-        // ALL Seeking is done when doing IO, since the file system is NOT contigous and files do not have a pre-allocated size.
-        
-        // Seeking to the data section
-        //fseekToDataSection(active_file_table[activeFileIndex]);
-        // Seeking to first block
-        
-    }
-    
-    return FATindex;
+    free(partitionData);
+    partitionData = nextData;
+    currentPartition = disk;
+    fat[file] = entries[file];
+    return (int)count;
 }
 
-void closeFile(int file){
-    
-    // Checking if the file is not already open
-    int i = 0;
-    for (; i < MAX_OPENFILES; i++)
-        if(active_file_table_owners[i] == file)
-            break;
-    
-    if(i == MAX_OPENFILES)
-        return; // File not acutally open
-    
-    fclose(active_file_table[i]);
-    active_file_table_owners[i] = -1;
-    
-    return;
+int inspectDiskBlock(int block, unsigned char *bytes, size_t capacity) {
+    if (!partitionData || !bytes || block < 0 || block >= currentPartition.total_blocks ||
+        capacity < (size_t)currentPartition.block_size) return -1;
+    size_t blocksize = (size_t)currentPartition.block_size;
+    memcpy(bytes, partitionData + (size_t)block * blocksize, blocksize);
+    return currentPartition.block_size;
 }
 
-char *readBlock(int file){
-    
-    if(file < 0)
-        return NULL; // File open opreation probably failed before this call. We should never get here.
-
-    if(fat[file].current_location >= MAX_BLOCKS)
-        return NULL;
-    
-    // Lookup the block to read from
-    int blockToRead = fat[file].blockPtrs[fat[file].current_location];
-    
-    // Seeing the block is valid
-    if(blockToRead == -1)
-        return NULL;
-        
-    // Get the file pointer
-    FILE *filePtr = NULL;
-    int i = 0;
-    for (; i < MAX_OPENFILES; i++)
-        if(active_file_table_owners[i] == file){
-                filePtr = active_file_table[i];
-            break;
-        }
-    if(i == MAX_OPENFILES)
-        return NULL; // File was not open before this call
-    
-    // Seek to the block
-    fseekToBlock(filePtr, blockToRead);
-    
-
-    // Reading the block char by char into the buffer
-    i = 0;
-    for (; i < currentPartition.block_size; i++) {
-        char c = fgetc(filePtr);
-        if(c == '0'){
-            blockBuffer[i] = '\0';
-            break;
-        }
-        blockBuffer[i] = c;
+static int activeSlot(int file) {
+    if (file < 0 || file >= MAX_FILES) return -1;
+    for (int i = 0; i < MAX_OPENFILES; i++) {
+        if (active_file_table[i] && active_file_table_owners[i] == file) return i;
     }
-    blockBuffer[i] = '\0';
-    
-    fat[file].current_location += 1;
-    
+    return -1;
+}
+
+int openFile(char *name) {
+    int entry = diskOpenEntry(name);
+    if (entry < 0 || activeSlot(entry) >= 0) return entry;
+    for (int i = 0; i < MAX_OPENFILES; i++) {
+        if (active_file_table[i]) continue;
+        active_file_table[i] = fopen(partitionPath, "rb");
+        if (!active_file_table[i]) return -1;
+        active_file_table_owners[i] = entry;
+        fat[entry].current_location = 0;
+        return entry;
+    }
+    return -1;
+}
+
+void closeFile(int file) {
+    int slot = activeSlot(file);
+    if (slot < 0) return;
+    fclose(active_file_table[slot]);
+    active_file_table[slot] = NULL;
+    active_file_table_owners[slot] = -1;
+}
+
+char *readBlock(int file) {
+    if (activeSlot(file) < 0 || fat[file].current_location >= MAX_BLOCKS) return NULL;
+    int offset = fat[file].current_location * currentPartition.block_size;
+    int length = diskReadBytes(file, offset, blockBuffer, (size_t)currentPartition.block_size);
+    if (length <= 0) return NULL;
+    blockBuffer[length] = '\0';
+    fat[file].current_location++;
     return blockBuffer;
 }
-int writeBlock(int file, char *data){
-    
-    if(file < 0)
-        return 0; // File open opreation probably failed before this call. We should never get here.
-    
-    if(fat[file].current_location >= MAX_BLOCKS)
-        return 0; // No more blocks are available for the file
-    
-    // Appending by default
-    fat[file].current_location = fat[file].file_length;
-    
-    // Get the file pointer
-    FILE *filePtr = NULL;
-    int i = 0;
-    for (; i < MAX_OPENFILES; i++)
-        if(active_file_table_owners[i] == file){
-            filePtr = active_file_table[i];
-            break;
-        }
-    if(i == MAX_OPENFILES)
-        return 1; // File was not open before this call
-    
-    // Seek to next free block
-    fseekToNextFreeBlock(filePtr);
-    
-    // Writing the block char by char into the buffer
-    for (int i = 0; i < currentPartition.block_size; i++) {
-        char c = *(data+i);
-        if(c == 0)
-            c = '0';
-        fputc(c, filePtr);
-    }
-    
-    // Updating the file's blockPtr array
-    fat[file].blockPtrs[fat[file].current_location] = currentPartition.last_free_block;
-    
-    currentPartition.last_free_block += 1;
-    fat[file].current_location += 1;
-    fat[file].file_length +=1;
-    if(fat[file].current_location < MAX_BLOCKS)
-        fat[file].blockPtrs[fat[file].current_location] = -1;
-    
-    // Update the FAT on disk
-    partitionFile = fopen(filename, "r+");
-    updateFATOnDisk();
-    fclose(partitionFile);
-    
-    return 1;
-}
 
-#pragma mark Private Helper Functions
-
-int partitionFolderExists(){
-    
-    struct stat partitionFolder;
-    int error = stat("./PARTITION", &partitionFolder);
-    
-    if (error != 0)
-        return 0;
-
-    if(partitionFolder.st_mode & S_IFDIR)
-        return 1;
-    else
-        return 0;
-}
-
-void fseekToDataSection(FILE *file){
-    
-    fseek(file, 0, SEEK_SET);
-    
-    for (int i = MAX_FILES*2 +1; i > 0; i--)
-        fgets(writebuffer, 50000, file);
-    return;
-}
-
-void fseekToBlock(FILE *file, int blockID){
-    
-    fseekToDataSection(file);
-    
-    for (int i = blockID * currentPartition.block_size; i > 0; i--)
-        fgetc(file);
-    
-    fseek(file, 0, SEEK_CUR );
-    return;
-}
-
-
-void fseekToNextFreeBlock(FILE *file){
-     
-    fseekToBlock(file, currentPartition.last_free_block);
-    return;
-}
-
-
-void updateFATOnDisk(){
-    // This function will simply seek to the begining of the partition file and copy
-    // the whole FAT again leaving the file pointer at the begining of the data section
-    
-    // Seeking to the begining
-    fseek(partitionFile, 0, SEEK_SET);
-    
-    // Writting the contents of currentPartition onto the file
-    sprintf(writebuffer, "%i, %i, %i\n", currentPartition.block_size, currentPartition.total_blocks, currentPartition.last_free_block);
-    fprintf(partitionFile, "%s", writebuffer);
-    
-    // Writting the contents of fat[MAX_FILES] to the file
-    for (int i = 0; i < MAX_FILES; i++) {
-        struct FAT currentFile = fat[i];
-        sprintf(writebuffer, "%i", currentFile.blockPtrs[0]);
-        for (int j = 1; j < MAX_BLOCKS; j++)
-            sprintf(writebuffer, "%s; %i", writebuffer, currentFile.blockPtrs[j]);
-        sprintf(writebuffer2, "%s, %i\n %s\n", currentFile.filename, currentFile.file_length, writebuffer);
-        fprintf(partitionFile, "%s", writebuffer2);
-    }
-    
-    return;
+int writeBlock(int file, char *data) {
+    if (activeSlot(file) < 0 || !data) return 0;
+    size_t count = strnlen(data, (size_t)currentPartition.block_size);
+    return diskWriteBytes(file, fat[file].file_length, data, count) >= 0;
 }

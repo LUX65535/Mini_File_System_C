@@ -72,12 +72,12 @@ int run(int quanta){
         
         printf("%s", cpu.IR);
         
-        char **parsedCommand;
-        parsedCommand = malloc(5 * sizeof(char*));
+        char *parsedCommand[MAX_TOKENS];
         
         parser(cpu.IR, parsedCommand);
         int returnCode = 1;
         //int returnCode = interpreter(parsedCommand);
+        freeParsedCommand(parsedCommand);
 
         if(returnCode == 1)
             printf("Illegal instruction at RAM address: %i \n", readIP());

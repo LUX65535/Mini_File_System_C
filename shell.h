@@ -11,5 +11,6 @@ int shellUI(void);
 
 #pragma mark Shell Parser
 void parser(char *command, char *parsedCommand[]);
+void freeParsedCommand(char *parsedCommand[]);
 
 #endif /* shell_h */

@@ -1,11 +1,7 @@
-//    DISK_driver_problem4.h
+#ifndef DISK_DRIVER_PROBLEM4_H
+#define DISK_DRIVER_PROBLEM4_H
 
-
-/*
- * read exam implementation
- * file id is active file id opened
- * pp buf is to save the result
- */
 int readpipeExamImpl(int fd);
+char *acceptPipeInput(int fd);
 
-char* acceptPipeInput(int fd);
+#endif
